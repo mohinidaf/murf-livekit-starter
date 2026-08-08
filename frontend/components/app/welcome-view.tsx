@@ -12,15 +12,14 @@ export const WelcomeView = ({
   onStartCall,
 }: WelcomeViewProps) => {
   return (
-    <div className="min-h-screen w-full bg-gradient-to-br from-slate-950 via-slate-900 to-black text-white flex items-center justify-center p-8">
-
+    <div className="min-h-screen w-full bg-slate-950 text-white flex items-center justify-center px-6">
       <div className="max-w-6xl w-full grid lg:grid-cols-2 gap-16 items-center">
 
-        {/* Left */}
+        {/* Left side */}
         <div>
-
           <div className="inline-flex px-4 py-2 rounded-full bg-emerald-500/20 text-emerald-400 text-sm">
-            ● AI Financial Voice Assistant
+            <span className="mr-2">●</span>
+            AI Financial Voice Assistant
           </div>
 
           <h1 className="text-6xl font-bold mt-6">
@@ -28,45 +27,42 @@ export const WelcomeView = ({
           </h1>
 
           <p className="mt-6 text-xl text-slate-300 leading-relaxed">
-            Your intelligent voice assistant for Banking,
-            UPI, Loans, Credit Cards,
-            Insurance and Digital Payments.
+            Your intelligent voice assistant for Banking, UPI, Loans,
+            Credit Cards, Insurance and Digital Payments.
           </p>
 
           <div className="grid grid-cols-2 gap-4 mt-10">
-
             <div className="bg-slate-800 rounded-xl p-4">
-              💳 Credit & Debit Cards
+              Credit &amp; Debit Cards
             </div>
 
             <div className="bg-slate-800 rounded-xl p-4">
-              📱 UPI Payments
+              UPI Payments
             </div>
 
             <div className="bg-slate-800 rounded-xl p-4">
-              🏦 Banking & Loans
+              Banking &amp; Loans
             </div>
 
             <div className="bg-slate-800 rounded-xl p-4">
-              🛡 Fraud Protection
+              Fraud Protection
             </div>
-
           </div>
-
         </div>
 
-        {/* Right */}
-
+        {/* Right side */}
         <div className="flex flex-col items-center">
 
-          <div className="w-44 h-44 rounded-full bg-emerald-500/20 border border-emerald-400 animate-pulse flex items-center justify-center">
-
-            <div className="w-24 h-24 rounded-full bg-emerald-400"></div>
-
+          <div className="w-44 h-44 rounded-full bg-emerald-500/20 border border-emerald-400 flex items-center justify-center animate-pulse">
+            <div className="w-24 h-24 rounded-full bg-emerald-400" />
           </div>
 
-          <p className="mt-8 text-lg">
-            Talk naturally with FinAssist
+          <p className="mt-8 text-xl font-medium">
+            Ready to talk with FinAssist
+          </p>
+
+          <p className="mt-2 text-slate-400">
+            Your AI financial voice assistant
           </p>
 
           <Button
@@ -78,9 +74,7 @@ export const WelcomeView = ({
           </Button>
 
         </div>
-
       </div>
-
     </div>
   );
 };

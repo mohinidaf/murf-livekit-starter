@@ -1,8 +1,9 @@
 'use client';
 
 import { useTheme } from 'next-themes';
-import { AnimatePresence, motion } from 'motion/react';
+import { motion } from 'motion/react';
 import { useSessionContext } from '@livekit/components-react';
+
 import type { AppConfig } from '@/app-config';
 import { AgentSessionView_01 } from '@/components/agents-ui/blocks/agent-session-view-01';
 import { WelcomeView } from '@/components/app/welcome-view';
@@ -19,12 +20,12 @@ const VIEW_MOTION_PROPS = {
       opacity: 0,
     },
   },
-  initial: 'hidden',
-  animate: 'visible',
-  exit: 'hidden',
+  initial: 'hidden' as const,
+  animate: 'visible' as const,
+  exit: 'hidden' as const,
   transition: {
     duration: 0.5,
-    ease: 'linear',
+    ease: 'linear' as const,
   },
 };
 
@@ -37,8 +38,7 @@ export function ViewController({ appConfig }: ViewControllerProps) {
   const { resolvedTheme } = useTheme();
 
   return (
-    <AnimatePresence mode="wait">
-      {/* Welcome view */}
+    <>
       {!isConnected && (
         <MotionWelcomeView
           key="welcome"
@@ -47,7 +47,7 @@ export function ViewController({ appConfig }: ViewControllerProps) {
           onStartCall={start}
         />
       )}
-      {/* Session view */}
+
       {isConnected && (
         <MotionSessionView
           key="session-view"
@@ -55,23 +55,39 @@ export function ViewController({ appConfig }: ViewControllerProps) {
           supportsChatInput={appConfig.supportsChatInput}
           supportsVideoInput={appConfig.supportsVideoInput}
           supportsScreenShare={appConfig.supportsScreenShare}
-          isPreConnectBufferEnabled={appConfig.isPreConnectBufferEnabled}
+          isPreConnectBufferEnabled={
+            appConfig.isPreConnectBufferEnabled
+          }
           audioVisualizerType={appConfig.audioVisualizerType}
           audioVisualizerColor={
             resolvedTheme === 'dark'
               ? appConfig.audioVisualizerColorDark
               : appConfig.audioVisualizerColor
           }
-          audioVisualizerColorShift={appConfig.audioVisualizerColorShift}
-          audioVisualizerBarCount={appConfig.audioVisualizerBarCount}
-          audioVisualizerGridRowCount={appConfig.audioVisualizerGridRowCount}
-          audioVisualizerGridColumnCount={appConfig.audioVisualizerGridColumnCount}
-          audioVisualizerRadialBarCount={appConfig.audioVisualizerRadialBarCount}
-          audioVisualizerRadialRadius={appConfig.audioVisualizerRadialRadius}
-          audioVisualizerWaveLineWidth={appConfig.audioVisualizerWaveLineWidth}
+          audioVisualizerColorShift={
+            appConfig.audioVisualizerColorShift
+          }
+          audioVisualizerBarCount={
+            appConfig.audioVisualizerBarCount
+          }
+          audioVisualizerGridRowCount={
+            appConfig.audioVisualizerGridRowCount
+          }
+          audioVisualizerGridColumnCount={
+            appConfig.audioVisualizerGridColumnCount
+          }
+          audioVisualizerRadialBarCount={
+            appConfig.audioVisualizerRadialBarCount
+          }
+          audioVisualizerRadialRadius={
+            appConfig.audioVisualizerRadialRadius
+          }
+          audioVisualizerWaveLineWidth={
+            appConfig.audioVisualizerWaveLineWidth
+          }
           className="fixed inset-0"
         />
       )}
-    </AnimatePresence>
+    </>
   );
 }
