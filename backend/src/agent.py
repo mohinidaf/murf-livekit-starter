@@ -1,8 +1,8 @@
 import logging
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
-
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -15,13 +15,19 @@ from livekit.agents import (
 )
 
 from database import get_user, save_user
-
+from scheme_data import (
+    DATA_SOURCE,
+    LAST_UPDATED,
+    get_scheme_info,
+    list_available_schemes,
+)
 
 # ============================================================
 # ENVIRONMENT
 # ============================================================
 
-load_dotenv(".env.local")
+_backend_dir = Path(__file__).resolve().parent.parent
+load_dotenv(_backend_dir / ".env.local")
 
 
 # ============================================================
@@ -41,8 +47,8 @@ logger.info(
 # FINASSIST AGENT
 # ============================================================
 
-class FinAssist(Agent):
 
+class FinAssist(Agent):
     def __init__(self):
         super().__init__(
             instructions="""
@@ -74,10 +80,11 @@ Never ask for or store:
 - Full bank account number
 - Aadhaar number
 
-You have two memory tools:
+You have three tools:
 
 1. lookup_user
 2. save_user_memory
+3. get_scheme_document_checklist
 
 MEMORY RULES:
 
@@ -100,6 +107,26 @@ lookup_user if you have their name.
 
 Never claim to remember someone unless lookup_user confirms
 that saved information exists.
+
+SCHEME DOCUMENT TOOL:
+
+When the user asks what documents, certificates, proofs, or
+paperwork are needed for any Indian government financial scheme,
+call get_scheme_document_checklist with the scheme name.
+
+This covers questions like:
+- "What documents do I need for PM-KISAN?"
+- "Which papers are required for a Mudra loan?"
+- "What proofs do I need for Ayushman Bharat?"
+
+When you read the result back to the user, convert it into
+natural spoken language. Do NOT read JSON or bullet symbols.
+Mention that the data is from a local dataset and state the
+last updated date.
+
+If the tool returns a failure, tell the user you cannot access
+the information right now and do not want to give inaccurate
+details. Do NOT invent document lists if the tool fails.
 """
         )
 
@@ -131,7 +158,7 @@ that saved information exists.
 
         try:
             user = get_user(user_id)
-        except Exception as e:
+        except Exception:
             logger.exception("Database lookup failed")
             return "I could not access the memory database right now."
 
@@ -141,9 +168,7 @@ that saved information exists.
                 user_id,
             )
 
-            return (
-                "No saved information was found for this user."
-            )
+            return "No saved information was found for this user."
 
         logger.info(
             "Returning user found: %s",
@@ -209,9 +234,91 @@ that saved information exists.
             user_id,
         )
 
-        return (
-            f"Memory saved successfully for {clean_name}."
+        return f"Memory saved successfully for {clean_name}."
+
+    # ========================================================
+    # SCHEME DOCUMENT CHECKLIST
+    # ========================================================
+
+    @function_tool
+    async def get_scheme_document_checklist(
+        self,
+        context: RunContext,
+        scheme_name: str,
+    ) -> str:
+        """
+        Get the document checklist required to apply for an Indian
+        government financial scheme.
+
+        Call this tool when the user asks what documents, certificates,
+        proofs, or paperwork they need for a specific government
+        scheme, subsidy, insurance plan, or financial programme.
+        Trigger for questions like:
+        - "What documents do I need for PM-KISAN?"
+        - "Which papers are required for a Mudra loan?"
+        - "What proofs do I need to apply for Ayushman Bharat?"
+        - "List the certificates for Sukanya Samriddhi."
+
+        The tool handles schemes including PM-KISAN, PMJJBY, PMSBY,
+        MUDRA loan, Sukanya Samriddhi, Atal Pension Yojana,
+        Jan Dhan Yojana, Kisan Credit Card, and Ayushman Bharat.
+        """
+
+        logger.info(
+            "TOOL CALLED: get_scheme_document_checklist (scheme_name=%s)",
+            scheme_name,
         )
+
+        if not scheme_name or not scheme_name.strip():
+            available = list_available_schemes()
+            return (
+                "No scheme name was provided. "
+                f"Available schemes: {', '.join(available)}. "
+                "Please ask about a specific scheme."
+            )
+
+        try:
+            info = get_scheme_info(scheme_name)
+        except Exception:
+            logger.exception("Failed to look up scheme data")
+            return (
+                "FAILURE: Unable to access scheme information "
+                "right now. I do not want to give you inaccurate "
+                "information. Please try again later or check the "
+                "official scheme website."
+            )
+
+        if info is None:
+            available = list_available_schemes()
+            logger.info(
+                "Scheme not found: %s. Available: %s",
+                scheme_name,
+                available,
+            )
+            return (
+                f"I could not find a scheme called '{scheme_name}'. "
+                f"Available schemes are: {', '.join(available)}. "
+                "Please ask about one of these schemes."
+            )
+
+        doc_list = "\n".join(f"- {doc}" for doc in info["documents"])
+
+        result = (
+            f"Scheme: {info['full_name']}\n"
+            f"Objective: {info['objective']}\n"
+            f"Required documents:\n{doc_list}\n"
+            f"Eligibility notes: {info['eligibility_notes']}\n"
+            f"Data source: {DATA_SOURCE}\n"
+            f"Data last updated: {LAST_UPDATED}\n"
+            f"Data type: Local dataset (not live data)"
+        )
+
+        logger.info(
+            "Scheme checklist returned for: %s",
+            info["full_name"],
+        )
+
+        return result
 
     # ========================================================
     # STABLE USER ID
@@ -229,9 +336,7 @@ that saved information exists.
 
         clean_name = name.strip().lower()
 
-        clean_name = "_".join(
-            clean_name.split()
-        )
+        clean_name = "_".join(clean_name.split())
 
         return f"user_{clean_name}"
 
@@ -246,6 +351,7 @@ server = AgentServer()
 # IMPORTANT:
 # This must match the agent name requested by the frontend.
 # ============================================================
+
 
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
@@ -269,9 +375,7 @@ async def my_agent(ctx: JobContext):
     # CREATE VOICE SESSION
     # --------------------------------------------------------
 
-    logger.info(
-        "Creating FinAssist voice session..."
-    )
+    logger.info("Creating FinAssist voice session...")
 
     session = AgentSession(
         stt=inference.STT(
