@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FinAssist — Outbound Call Demo</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #0f172a; color: #e2e8f0;
+    display: flex; justify-content: center; align-items: center; min-height: 100vh;
+  }
+  .card {
+    background: #1e293b; border-radius: 16px; padding: 40px;
+    max-width: 420px; width: 90%; text-align: center;
+    box-shadow: 0 25px 50px rgba(0,0,0,0.5);
+  }
+  .status {
+    font-size: 14px; color: #94a3b8; margin-bottom: 8px;
+    text-transform: uppercase; letter-spacing: 2px;
+  }
+  .stage {
+    font-size: 22px; font-weight: 600; margin-bottom: 24px; min-height: 32px;
+  }
+  .stage.calling   { color: #facc15; }
+  .stage.ringing   { color: #fb923c; }
+  .stage.connected { color: #34d399; }
+  .stage.ended     { color: #f87171; }
+  .visualizer {
+    height: 80px; margin: 24px 0; display: flex;
+    align-items: center; justify-content: center; gap: 3px;
+  }
+  .bar {
+    width: 4px; background: #10b981; border-radius: 2px; height: 4px;
+    transition: height 0.08s ease;
+  }
+  .greeting {
+    font-size: 15px; color: #cbd5e1; line-height: 1.6;
+    margin: 20px 0; min-height: 60px;
+  }
+  .btn {
+    padding: 12px 32px; border: none; border-radius: 8px;
+    font-size: 15px; font-weight: 600; cursor: pointer;
+    transition: all 0.2s; margin: 6px;
+  }
+  .btn-start { background: #10b981; color: #fff; }
+  .btn-start:hover { background: #059669; }
+  .btn-end { background: #ef4444; color: #fff; }
+  .btn-end:hover { background: #dc2626; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .info { font-size: 12px; color: #64748b; margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="status" id="status">Ready</div>
+  <div class="stage" id="stage">Press Start to begin</div>
+  <div class="visualizer" id="visualizer"></div>
+  <div class="greeting" id="greeting"></div>
+  <div>
+    <button class="btn btn-start" id="btnStart">Start Call</button>
+    <button class="btn btn-end" id="btnEnd" disabled>End Call</button>
+  </div>
+  <div class="info">Simulated outbound call — Day 6 Demo</div>
+</div>
+
+<script type="module">
+  import {
+    Room,
+    RoomEvent,
+    Track,
+  } from 'https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs';
+
+  const params = new URLSearchParams(window.location.search);
+  const SERVER_URL = params.get('serverUrl');
+  const ROOM_NAME  = params.get('room');
+  const TOKEN      = params.get('token');
+
+  const $status  = document.getElementById('status');
+  const $stage   = document.getElementById('stage');
+  const $greeting = document.getElementById('greeting');
+  const $btnStart = document.getElementById('btnStart');
+  const $btnEnd   = document.getElementById('btnEnd');
+  const $viz      = document.getElementById('visualizer');
+
+  // Build visualizer bars
+  for (let i = 0; i < 24; i++) {
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    $viz.appendChild(bar);
+  }
+  const bars = $viz.querySelectorAll('.bar');
+
+  function setStage(text, cls) {
+    $stage.textContent = text;
+    $stage.className = 'stage ' + cls;
+  }
+
+  let room = null;
+
+  $btnStart.addEventListener('click', async () => {
+    $btnStart.disabled = true;
+    setStage('Calling...', 'calling');
+    $status.textContent = 'Calling...';
+    $greeting.textContent = '';
+
+    room = new Room({ adaptiveStream: true, dynacast: true });
+
+    room.on(RoomEvent.Connected, () => {
+      setStage('Ringing...', 'ringing');
+      $status.textContent = 'Ringing...';
+    });
+
+    room.on(RoomEvent.TrackSubscribed, (track) => {
+      if (track.kind === Track.Kind.Audio) {
+        const el = track.attach();
+        document.body.appendChild(el);
+
+        setStage('Connected', 'connected');
+        $status.textContent = 'Agent speaking...';
+        $btnEnd.disabled = false;
+
+        // Simple audio-level visualizer
+        try {
+          const ctx = new AudioContext();
+          const src = ctx.createMediaStreamSource(
+            new MediaStream([el.srcObject.getAudioTracks()[0]])
+          );
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 64;
+          src.connect(analyser);
+          const data = new Uint8Array(analyser.frequencyBinCount);
+          function viz() {
+            analyser.getByteFrequencyData(data);
+            bars.forEach((b, i) => {
+              const v = data[i % data.length] || 0;
+              b.style.height = (4 + (v / 255) * 56) + 'px';
+            });
+            if (room && room.state !== 'disconnected') {
+              requestAnimationFrame(viz);
+            }
+          }
+          viz();
+        } catch (_) { /* audio viz is optional */ }
+      }
+    });
+
+    room.on(RoomEvent.Disconnected, () => {
+      setStage('Call ended', 'ended');
+      $status.textContent = 'Disconnected';
+      $btnStart.disabled = false;
+      $btnEnd.disabled = true;
+      bars.forEach(b => b.style.height = '4px');
+    });
+
+    try {
+      await room.connect(SERVER_URL, TOKEN);
+    } catch (e) {
+      setStage('Connection failed', 'ended');
+      $status.textContent = 'Error: ' + e.message;
+      $btnStart.disabled = false;
+    }
+  });
+
+  $btnEnd.addEventListener('click', () => {
+    if (room) room.disconnect();
+    setStage('Call ended', 'ended');
+    $status.textContent = 'Call ended';
+    $btnEnd.disabled = true;
+    $btnStart.disabled = false;
+    bars.forEach(b => b.style.height = '4px');
+  });
+</script>
+</body>
+</html>

@@ -276,3 +276,184 @@ For deeper documentation on each part, see:
 ## License
 
 MIT
+
+---
+
+## Day 5 — Scheme Document Checklist Tool
+
+### What it does
+
+A `get_scheme_document_checklist` function tool is now connected to
+the FinAssist voice agent. When the user asks what documents,
+certificates, proofs, or paperwork are required for an Indian
+government financial scheme, the agent automatically calls this
+tool and reads the checklist back in natural spoken language.
+
+Supported schemes:
+
+- PM-KISAN
+- PMJJBY (Pradhan Mantri Jeevan Jyoti Bima Yojana)
+- PMSBY (Pradhan Mantri Suraksha Bima Yojana)
+- MUDRA Loan
+- Sukanya Samriddhi Yojana
+- Atal Pension Yojana
+- Jan Dhan Yojana
+- Kisan Credit Card (KCC)
+- Ayushman Bharat (AB-PMJAY)
+
+### Data source
+
+Local dataset compiled from publicly available scheme guidelines
+and official ministry notifications. This is **not** live data.
+
+**Last updated:** 2026-08-10
+
+### Failure handling
+
+If the tool cannot find a scheme or encounters an error, it
+returns a clear failure message. The agent then tells the user:
+
+> "I'm unable to access the scheme information right now, so I
+> don't want to give you inaccurate information."
+
+The agent does **not** hallucinate document lists when the tool
+fails.
+
+### Example user question
+
+> "What documents do I need for a Mudra loan?"
+
+### Example tool response (internal, not spoken)
+
+```
+Scheme: MUDRA (Micro Units Development and Refinance Agency) Loan
+Objective: Provides loans up to ten lakh rupees to non-corporate,
+non-farm small or micro enterprises.
+Required documents:
+- Identity proof (Aadhaar, PAN, or voter ID)
+- Address proof (utility bill, Aadhaar, or rental agreement)
+- Passport-size photograph
+- Business plan or project report
+- Proof of business existence (registration, licence, or shop act certificate)
+- Bank account statements for the last six months
+- Quotation for machinery or equipment (if applicable)
+- Category certificate (SC/ST/OBC) if applicable
+Data source: Local dataset compiled from publicly available scheme guidelines.
+Data last updated: 2026-08-10
+Data type: Local dataset (not live data)
+```
+
+### Files changed for Day 5
+
+- `backend/src/scheme_data.py` — new local dataset
+- `backend/src/agent.py` — added `get_scheme_document_checklist`
+  tool and updated system prompt
+- `README.md` — this section
+
+---
+
+## Day 6 — Outbound Phone Calls
+
+### What it does
+
+The FinAssist agent can now place outbound phone calls to a
+phone number you control. When the agent receives a dispatch
+with `"outbound": true` in the metadata, it:
+
+1. Reads the destination phone number from metadata
+2. Creates a SIP participant via LiveKit's SIP API
+3. Places the call through your configured Twilio SIP trunk
+4. Uses a phone-appropriate greeting that:
+   - Identifies the agent as FinAssist
+   - Explains the purpose of the call
+   - Clearly states this is an automated/AI call
+   - Gives the user a way to opt out ("say stop at any time")
+5. Offers an `end_call` tool so the agent can hang up when
+   the conversation is finished
+
+### Architecture
+
+```
+dispatch_call.py
+  → LiveKit Agent Dispatch API
+    → my_agent entrypoint
+      → detects "outbound: true" in metadata
+      → ctx.add_sip_participant(trunk_id, phone_number)
+      → Twilio SIP trunk → PSTN → your phone rings
+      → FinAssist answers and starts conversation
+```
+
+### New environment variables
+
+| Variable | Where to get it |
+|---|---|
+| `SIP_OUTBOUND_TRUNK_ID` | LiveKit Cloud → Telephony → SIP Trunks → your outbound trunk ID |
+| `TWILIO_PHONE_NUMBER` | Your Twilio phone number (e.g. `+15105550123`) |
+
+### External configuration (outside the code)
+
+You must set up three things before outbound calling works:
+
+**1. Twilio Console**
+
+- Purchase a phone number (if you don't have one)
+- Create an Elastic SIP Trunk
+- Under **Termination**, set a domain like `finassist.pstn.twilio.com`
+- Create a **Credential List** (username + password) and attach
+  it to the trunk
+- Associate your phone number with the trunk
+
+**2. LiveKit Cloud Dashboard**
+
+- Go to **Telephony → SIP Trunks → Create new trunk**
+- Select **Outbound** direction
+- Set:
+  - **Name:** `Twilio outbound`
+  - **Address:** `finassist.pstn.twilio.com`
+  - **Numbers:** `["+15105550123"]` (your Twilio number)
+  - **Auth username/password:** match your Twilio credential list
+- Copy the trunk ID → set as `SIP_OUTBOUND_TRUNK_ID`
+
+**3. Start the agent**
+
+```bash
+cd backend
+uv run python src/agent.py dev
+```
+
+### How to trigger an outbound call
+
+In a separate terminal:
+
+```bash
+cd backend
+python src/dispatch_call.py +919876543210
+```
+
+Replace `+919876543210` with your actual phone number (must
+include country code with `+` prefix).
+
+### What to expect
+
+1. Your phone rings
+2. You hear FinAssist introduce itself as an AI assistant
+3. The agent explains it is an automated call
+4. You can say "stop" at any time to end the call
+5. You can ask about financial services, schemes, etc.
+6. The agent has the `end_call` tool to hang up when done
+
+### Failure handling
+
+- **Invalid phone number:** SIP returns an error, logged in agent
+- **Busy/no answer:** SIP timeout, agent logs the failure and shuts down
+- **Call disconnected:** Room is deleted, agent exits cleanly
+- **Missing trunk ID:** Agent logs an error and refuses to dial
+
+### Files changed for Day 6
+
+- `backend/src/agent.py` — added outbound detection, SIP call
+  logic, phone greeting, and `end_call` tool
+- `backend/src/dispatch_call.py` — new script to trigger calls
+- `backend/.env.local` — added `SIP_OUTBOUND_TRUNK_ID` and
+  `TWILIO_PHONE_NUMBER`
+- `README.md` — this section

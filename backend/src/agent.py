@@ -1,8 +1,10 @@
+import json
 import logging
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from livekit import api
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -11,8 +13,9 @@ from livekit.agents import (
     RunContext,
     cli,
     function_tool,
-    inference,
+    get_job_context,
 )
+from livekit.plugins import deepgram, google, murf
 
 from database import get_user, save_user
 from scheme_data import (
@@ -80,11 +83,12 @@ Never ask for or store:
 - Full bank account number
 - Aadhaar number
 
-You have three tools:
+You have four tools:
 
 1. lookup_user
 2. save_user_memory
 3. get_scheme_document_checklist
+4. end_call
 
 MEMORY RULES:
 
@@ -340,6 +344,25 @@ details. Do NOT invent document lists if the tool fails.
 
         return f"user_{clean_name}"
 
+    # ========================================================
+    # END CALL
+    # ========================================================
+
+    @function_tool
+    async def end_call(self, context: RunContext) -> str:
+        """
+        End the current phone call. Call this when the user says
+        goodbye, asks to stop, or the conversation is finished.
+        Also call this if the user asks you to stop calling them.
+        """
+        logger.info("TOOL CALLED: end_call")
+
+        job_ctx = get_job_context()
+
+        await job_ctx.delete_room()
+
+        return "Call ended."
+
 
 # ============================================================
 # LIVEKIT SERVER
@@ -361,6 +384,29 @@ async def my_agent(ctx: JobContext):
     logger.info("========================================")
 
     # --------------------------------------------------------
+    # PARSE METADATA
+    # --------------------------------------------------------
+
+    metadata = {}
+    raw_metadata = ctx.job.metadata
+    if raw_metadata:
+        try:
+            metadata = json.loads(raw_metadata)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Could not parse job metadata: %s", raw_metadata)
+
+    is_outbound = metadata.get("outbound", False)
+    phone_number = metadata.get("phone_number", "")
+
+    if is_outbound:
+        logger.info(
+            "Outbound call requested to: %s",
+            phone_number,
+        )
+    else:
+        logger.info("Browser/WebRTC session (not outbound)")
+
+    # --------------------------------------------------------
     # CONNECT
     # --------------------------------------------------------
 
@@ -372,21 +418,77 @@ async def my_agent(ctx: JobContext):
     )
 
     # --------------------------------------------------------
+    # OUTBOUND CALL: CREATE SIP PARTICIPANT
+    # --------------------------------------------------------
+
+    demo_mode = False
+
+    if is_outbound:
+        trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID", "")
+        if not trunk_id:
+            logger.warning(
+                "SIP_OUTBOUND_TRUNK_ID not set — running in DEMO mode "
+                "(outbound greeting will play in this terminal)"
+            )
+            demo_mode = True
+
+        if not phone_number:
+            phone_number = "demo-user"
+
+        if not demo_mode:
+            logger.info(
+                "Creating SIP participant: trunk=%s, call_to=%s",
+                trunk_id,
+                phone_number,
+            )
+
+            try:
+                await ctx.add_sip_participant(
+                    call_to=phone_number,
+                    trunk_id=trunk_id,
+                    participant_identity=phone_number,
+                    participant_name="Outbound caller",
+                )
+            except api.TwirpError as e:
+                sip_code = e.metadata.get("sip_status_code", "unknown")
+                sip_status = e.metadata.get("sip_status", "unknown")
+                logger.error(
+                    "SIP call failed: %s (SIP %s %s) — falling back to demo mode",
+                    e.message,
+                    sip_code,
+                    sip_status,
+                )
+                demo_mode = True
+            except Exception:
+                logger.exception("SIP call error — falling back to demo mode")
+                demo_mode = True
+
+        if not demo_mode:
+            logger.info("SIP participant created, waiting for answer...")
+
+            try:
+                participant = await ctx.wait_for_participant(
+                    identity=phone_number,
+                )
+            except Exception:
+                logger.exception("Timed out waiting — falling back to demo mode")
+                demo_mode = True
+            else:
+                logger.info(
+                    "SIP participant joined: %s",
+                    participant.identity,
+                )
+
+    # --------------------------------------------------------
     # CREATE VOICE SESSION
     # --------------------------------------------------------
 
     logger.info("Creating FinAssist voice session...")
 
     session = AgentSession(
-        stt=inference.STT(
-            model="deepgram/nova-3",
-        ),
-        llm=inference.LLM(
-            model="openai/gpt-4o-mini",
-        ),
-        tts=inference.TTS(
-            model="cartesia/sonic-3",
-        ),
+        stt=deepgram.STT(),
+        llm=google.LLM(),
+        tts=murf.TTS(),
     )
 
     # --------------------------------------------------------
@@ -406,8 +508,57 @@ async def my_agent(ctx: JobContext):
     # FIRST MESSAGE
     # --------------------------------------------------------
 
-    await session.generate_reply(
-        instructions="""
+    if is_outbound:
+        await session.generate_reply(
+            instructions="""
+You are placing an outbound phone call on behalf of FinAssist,
+an AI financial voice assistant for India.
+
+The user did NOT initiate this call. You called them.
+
+Your opening MUST include ALL of the following in order:
+
+1. Greet the user and say who is calling:
+
+"Hello, this is FinAssist, an AI-powered financial
+assistant calling on behalf of our team."
+
+2. State the purpose of the call:
+
+"I'm calling to follow up on financial services you may
+be interested in, such as government schemes, banking,
+UPI, loans, or insurance."
+
+3. Clearly state this is an automated/AI call:
+
+"Please note, this is an automated AI call."
+
+4. Give the user a way to opt out:
+
+"If you do not wish to receive calls like this, you can
+say stop at any time, and we will not call you again."
+
+Then ask:
+
+"How are you today? Is this a good time to talk?"
+
+IMPORTANT RULES:
+
+- Be polite and professional.
+- Do NOT be pushy. If the user says they are busy or
+  do not want to talk, say goodbye and use the end_call
+  tool.
+- If the user asks you to stop calling, use end_call
+  immediately.
+- Keep the conversation short and helpful.
+- After the greeting, follow the standard memory rules
+  (ask name, look up user, etc.) if the user agrees
+  to continue talking.
+"""
+        )
+    else:
+        await session.generate_reply(
+            instructions="""
 Start the conversation.
 
 Say:
@@ -479,7 +630,7 @@ IMPORTANT:
 Never say that you remember the user unless lookup_user
 actually returned saved information.
 """
-    )
+        )
 
 
 # ============================================================
