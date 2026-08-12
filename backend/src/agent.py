@@ -1,8 +1,10 @@
 import json
 import logging
 import os
+import uuid
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 from livekit import api
 from livekit.agents import (
@@ -14,8 +16,9 @@ from livekit.agents import (
     cli,
     function_tool,
     get_job_context,
+    inference,
 )
-from livekit.plugins import deepgram, google, murf
+from livekit.plugins import deepgram, murf
 
 from database import get_user, save_user
 from scheme_data import (
@@ -24,6 +27,7 @@ from scheme_data import (
     get_scheme_info,
     list_available_schemes,
 )
+
 
 # ============================================================
 # ENVIRONMENT
@@ -71,6 +75,7 @@ You help users with:
 Keep your answers short, natural and easy to understand because
 this is a voice conversation.
 
+
 IMPORTANT SECURITY RULES:
 
 Never ask for or store:
@@ -83,12 +88,91 @@ Never ask for or store:
 - Full bank account number
 - Aadhaar number
 
-You have four tools:
+Never request sensitive financial credentials even if the user
+offers them.
+
+
+HUMAN HELP / ESCALATION RULES:
+
+You must ask for human help in these situations:
+
+1. POSSIBLE FRAUD
+
+If the user reports an unauthorized, suspicious, or unrecognized
+financial transaction, treat it as a possible fraud case.
+
+Examples:
+
+- "Someone used my account."
+- "I don't recognize this transaction."
+- "There is a payment I didn't make."
+- "I think someone has stolen my money."
+
+
+2. HUMAN FINANCIAL DECISION
+
+If the user asks you to make a financial decision that you are
+not authorized to make, escalate to a human.
+
+Examples:
+
+- Asking you to approve or reject a loan.
+- Asking you to personally review and resolve a financial dispute.
+- Asking for a case-specific decision that requires human review.
+- Asking you to override a financial decision.
+
+When escalation is needed:
+
+- Do not pretend that you can resolve the issue yourself.
+- Explain why human assistance is needed.
+- Tell the user what information you want to share with the human.
+- Ask the user for explicit permission before calling
+  create_escalation.
+- If the user says NO, do NOT call create_escalation.
+- If the user says YES, call create_escalation.
+
+Only send useful information:
+
+- Who needs help
+- What happened
+- What the agent already checked
+- How urgent it is
+- User's language
+- Preferred follow-up method
+
+Do NOT send:
+
+- OTP
+- UPI PIN
+- ATM PIN
+- CVV
+- Password
+- Full bank account number
+- Aadhaar number
+- Card number
+- Any other unnecessary private information
+
+After create_escalation succeeds:
+
+- Tell the user the reference ID.
+- Tell the user that the request has been created.
+- Explain that a human representative can review it.
+- Explain that the request status is OPEN.
+- Never promise an immediate response unless the system actually
+  guarantees one.
+
+For normal questions that do not require human assistance,
+DO NOT create an escalation request.
+
+
+You have five tools:
 
 1. lookup_user
 2. save_user_memory
 3. get_scheme_document_checklist
-4. end_call
+4. create_escalation
+5. end_call
+
 
 MEMORY RULES:
 
@@ -112,6 +196,7 @@ lookup_user if you have their name.
 Never claim to remember someone unless lookup_user confirms
 that saved information exists.
 
+
 SCHEME DOCUMENT TOOL:
 
 When the user asks what documents, certificates, proofs, or
@@ -119,12 +204,14 @@ paperwork are needed for any Indian government financial scheme,
 call get_scheme_document_checklist with the scheme name.
 
 This covers questions like:
+
 - "What documents do I need for PM-KISAN?"
 - "Which papers are required for a Mudra loan?"
 - "What proofs do I need for Ayushman Bharat?"
 
 When you read the result back to the user, convert it into
 natural spoken language. Do NOT read JSON or bullet symbols.
+
 Mention that the data is from a local dataset and state the
 last updated date.
 
@@ -258,6 +345,7 @@ details. Do NOT invent document lists if the tool fails.
         proofs, or paperwork they need for a specific government
         scheme, subsidy, insurance plan, or financial programme.
         Trigger for questions like:
+
         - "What documents do I need for PM-KISAN?"
         - "Which papers are required for a Mudra loan?"
         - "What proofs do I need to apply for Ayushman Bharat?"
@@ -275,6 +363,7 @@ details. Do NOT invent document lists if the tool fails.
 
         if not scheme_name or not scheme_name.strip():
             available = list_available_schemes()
+
             return (
                 "No scheme name was provided. "
                 f"Available schemes: {', '.join(available)}. "
@@ -285,6 +374,7 @@ details. Do NOT invent document lists if the tool fails.
             info = get_scheme_info(scheme_name)
         except Exception:
             logger.exception("Failed to look up scheme data")
+
             return (
                 "FAILURE: Unable to access scheme information "
                 "right now. I do not want to give you inaccurate "
@@ -294,18 +384,22 @@ details. Do NOT invent document lists if the tool fails.
 
         if info is None:
             available = list_available_schemes()
+
             logger.info(
                 "Scheme not found: %s. Available: %s",
                 scheme_name,
                 available,
             )
+
             return (
                 f"I could not find a scheme called '{scheme_name}'. "
                 f"Available schemes are: {', '.join(available)}. "
                 "Please ask about one of these schemes."
             )
 
-        doc_list = "\n".join(f"- {doc}" for doc in info["documents"])
+        doc_list = "\n".join(
+            f"- {doc}" for doc in info["documents"]
+        )
 
         result = (
             f"Scheme: {info['full_name']}\n"
@@ -325,6 +419,164 @@ details. Do NOT invent document lists if the tool fails.
         return result
 
     # ========================================================
+    # HUMAN ESCALATION
+    # ========================================================
+
+    @function_tool
+    async def create_escalation(
+        self,
+        context: RunContext,
+        issue: str,
+        summary: str,
+        urgency: str,
+        language: str,
+        preferred_followup: str,
+    ) -> str:
+        """
+        Create a human assistance request.
+
+        IMPORTANT:
+        Only call this tool AFTER the user has explicitly given
+        permission to share the summarized information with a human.
+        """
+
+        logger.info("TOOL CALLED: create_escalation")
+
+        # ----------------------------------------------------
+        # Generate reference ID
+        # ----------------------------------------------------
+
+        reference_id = (
+            f"ESC-{uuid.uuid4().hex[:6].upper()}"
+        )
+
+        # ----------------------------------------------------
+        # Validate urgency
+        # ----------------------------------------------------
+
+        allowed_urgency = {
+            "low",
+            "medium",
+            "high",
+            "emergency",
+        }
+
+        urgency_clean = urgency.strip().lower()
+
+        if urgency_clean not in allowed_urgency:
+            urgency_clean = "medium"
+
+        # ----------------------------------------------------
+        # Basic sensitive-information protection
+        # ----------------------------------------------------
+
+        sensitive_terms = [
+            "otp",
+            "upi pin",
+            "atm pin",
+            "cvv",
+            "password",
+            "aadhaar",
+            "account number",
+            "card number",
+        ]
+
+        combined_text = (
+            f"{issue} "
+            f"{summary} "
+            f"{language} "
+            f"{preferred_followup}"
+        ).lower()
+
+        for term in sensitive_terms:
+            if term in combined_text:
+                logger.warning(
+                    "Potential sensitive information detected "
+                    "in escalation request."
+                )
+
+                return (
+                    "I could not create the human assistance "
+                    "request because the information may contain "
+                    "sensitive financial data. Please provide only "
+                    "a general description of the problem without "
+                    "sharing private financial information."
+                )
+
+        # ----------------------------------------------------
+        # Create human-readable escalation
+        # ----------------------------------------------------
+
+        escalation_message = (
+            "🚨 HUMAN ESCALATION\n\n"
+            f"Reference ID: {reference_id}\n"
+            f"Issue: {issue}\n"
+            f"Summary: {summary}\n"
+            f"Urgency: {urgency_clean.upper()}\n"
+            f"Language: {language}\n"
+            f"Preferred follow-up: {preferred_followup}\n"
+            f"Status: OPEN"
+        )
+
+        # ----------------------------------------------------
+        # Get Discord webhook
+        # ----------------------------------------------------
+
+        webhook_url = os.getenv(
+            "DISCORD_ESCALATION_WEBHOOK_URL"
+        )
+
+        if not webhook_url:
+            logger.error(
+                "DISCORD_ESCALATION_WEBHOOK_URL is not configured."
+            )
+
+            return (
+                "The human assistance request could not be created "
+                "because the escalation service is not configured."
+            )
+
+        # ----------------------------------------------------
+        # Send request to Discord
+        # ----------------------------------------------------
+
+        try:
+            response = requests.post(
+                webhook_url,
+                json={
+                    "content": escalation_message
+                },
+                timeout=10,
+            )
+
+            response.raise_for_status()
+
+        except Exception:
+            logger.exception(
+                "Failed to send escalation request."
+            )
+
+            return (
+                "I could not create the human assistance request "
+                "right now. Please try again later."
+            )
+
+        # ----------------------------------------------------
+        # Log successful request
+        # ----------------------------------------------------
+
+        logger.info(
+            "Escalation created successfully: %s",
+            reference_id,
+        )
+
+        return (
+            f"Human assistance request created successfully. "
+            f"Reference ID: {reference_id}. "
+            f"Status: OPEN."
+        )
+
+    # ========================================================
     # STABLE USER ID
     # ========================================================
 
@@ -340,7 +592,9 @@ details. Do NOT invent document lists if the tool fails.
 
         clean_name = name.strip().lower()
 
-        clean_name = "_".join(clean_name.split())
+        clean_name = "_".join(
+            clean_name.split()
+        )
 
         return f"user_{clean_name}"
 
@@ -349,12 +603,16 @@ details. Do NOT invent document lists if the tool fails.
     # ========================================================
 
     @function_tool
-    async def end_call(self, context: RunContext) -> str:
+    async def end_call(
+        self,
+        context: RunContext,
+    ) -> str:
         """
         End the current phone call. Call this when the user says
         goodbye, asks to stop, or the conversation is finished.
         Also call this if the user asks you to stop calling them.
         """
+
         logger.info("TOOL CALLED: end_call")
 
         job_ctx = get_job_context()
@@ -388,23 +646,39 @@ async def my_agent(ctx: JobContext):
     # --------------------------------------------------------
 
     metadata = {}
+
     raw_metadata = ctx.job.metadata
+
     if raw_metadata:
         try:
             metadata = json.loads(raw_metadata)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("Could not parse job metadata: %s", raw_metadata)
 
-    is_outbound = metadata.get("outbound", False)
-    phone_number = metadata.get("phone_number", "")
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                "Could not parse job metadata: %s",
+                raw_metadata,
+            )
+
+    is_outbound = metadata.get(
+        "outbound",
+        False,
+    )
+
+    phone_number = metadata.get(
+        "phone_number",
+        "",
+    )
 
     if is_outbound:
         logger.info(
             "Outbound call requested to: %s",
             phone_number,
         )
+
     else:
-        logger.info("Browser/WebRTC session (not outbound)")
+        logger.info(
+            "Browser/WebRTC session (not outbound)"
+        )
 
     # --------------------------------------------------------
     # CONNECT
@@ -424,18 +698,26 @@ async def my_agent(ctx: JobContext):
     demo_mode = False
 
     if is_outbound:
-        trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID", "")
+
+        trunk_id = os.getenv(
+            "SIP_OUTBOUND_TRUNK_ID",
+            "",
+        )
+
         if not trunk_id:
             logger.warning(
-                "SIP_OUTBOUND_TRUNK_ID not set — running in DEMO mode "
-                "(outbound greeting will play in this terminal)"
+                "SIP_OUTBOUND_TRUNK_ID not set — running in "
+                "DEMO mode (outbound greeting will play in "
+                "this terminal)"
             )
+
             demo_mode = True
 
         if not phone_number:
             phone_number = "demo-user"
 
         if not demo_mode:
+
             logger.info(
                 "Creating SIP participant: trunk=%s, call_to=%s",
                 trunk_id,
@@ -443,37 +725,66 @@ async def my_agent(ctx: JobContext):
             )
 
             try:
+
                 await ctx.add_sip_participant(
                     call_to=phone_number,
                     trunk_id=trunk_id,
                     participant_identity=phone_number,
                     participant_name="Outbound caller",
                 )
+
             except api.TwirpError as e:
-                sip_code = e.metadata.get("sip_status_code", "unknown")
-                sip_status = e.metadata.get("sip_status", "unknown")
+
+                sip_code = e.metadata.get(
+                    "sip_status_code",
+                    "unknown",
+                )
+
+                sip_status = e.metadata.get(
+                    "sip_status",
+                    "unknown",
+                )
+
                 logger.error(
-                    "SIP call failed: %s (SIP %s %s) — falling back to demo mode",
+                    "SIP call failed: %s "
+                    "(SIP %s %s) — falling back to demo mode",
                     e.message,
                     sip_code,
                     sip_status,
                 )
+
                 demo_mode = True
+
             except Exception:
-                logger.exception("SIP call error — falling back to demo mode")
+
+                logger.exception(
+                    "SIP call error — falling back to demo mode"
+                )
+
                 demo_mode = True
 
         if not demo_mode:
-            logger.info("SIP participant created, waiting for answer...")
+
+            logger.info(
+                "SIP participant created, waiting for answer..."
+            )
 
             try:
+
                 participant = await ctx.wait_for_participant(
                     identity=phone_number,
                 )
+
             except Exception:
-                logger.exception("Timed out waiting — falling back to demo mode")
+
+                logger.exception(
+                    "Timed out waiting — falling back to demo mode"
+                )
+
                 demo_mode = True
+
             else:
+
                 logger.info(
                     "SIP participant joined: %s",
                     participant.identity,
@@ -483,11 +794,18 @@ async def my_agent(ctx: JobContext):
     # CREATE VOICE SESSION
     # --------------------------------------------------------
 
-    logger.info("Creating FinAssist voice session...")
+    logger.info(
+        "Creating FinAssist voice session..."
+    )
 
     session = AgentSession(
         stt=deepgram.STT(),
-        llm=google.LLM(),
+        llm=inference.LLM(
+            model="google/gemini-2.5-flash-lite",
+            extra_kwargs={
+                "max_completion_tokens": 1000
+            }
+        ),
         tts=murf.TTS(),
     )
 
@@ -501,7 +819,9 @@ async def my_agent(ctx: JobContext):
     )
 
     logger.info("========================================")
-    logger.info("FinAssist session started successfully")
+    logger.info(
+        "FinAssist session started successfully"
+    )
     logger.info("========================================")
 
     # --------------------------------------------------------
@@ -509,6 +829,7 @@ async def my_agent(ctx: JobContext):
     # --------------------------------------------------------
 
     if is_outbound:
+
         await session.generate_reply(
             instructions="""
 You are placing an outbound phone call on behalf of FinAssist,
@@ -556,7 +877,9 @@ IMPORTANT RULES:
   to continue talking.
 """
         )
+
     else:
+
         await session.generate_reply(
             instructions="""
 Start the conversation.
@@ -625,10 +948,25 @@ For example:
 
 Do not invent memories.
 
-IMPORTANT:
 
-Never say that you remember the user unless lookup_user
-actually returned saved information.
+IMPORTANT HUMAN ESCALATION RULE:
+
+If the user reports possible fraud, an unauthorized or
+unrecognized transaction, or asks for a financial decision
+that requires human review:
+
+1. Explain that human assistance is needed.
+2. Tell the user what information will be shared.
+3. Ask for explicit permission.
+4. Wait for the user's answer.
+5. Only if the user clearly agrees, call create_escalation.
+6. If the user says NO, do not call create_escalation.
+7. After successful escalation, provide the reference ID
+   and explain that the request is OPEN.
+
+Never include OTPs, PINs, CVVs, passwords, full account
+numbers, Aadhaar numbers, or other sensitive credentials
+in the escalation.
 """
         )
 
