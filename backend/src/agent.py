@@ -6,6 +6,10 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+
+# Patch must run before livekit.agents to fix race condition
+import livekit_patch  # isort: skip  # noqa: F401
+
 from livekit import api
 from livekit.agents import (
     Agent,
@@ -20,13 +24,26 @@ from livekit.agents import (
 )
 from livekit.plugins import deepgram, murf
 
-from database import get_user, save_user
+from database import (
+    get_user,
+    log_call_end,
+    log_call_start,
+    save_user,
+)
 from scheme_data import (
     DATA_SOURCE,
     LAST_UPDATED,
     get_scheme_info,
     list_available_schemes,
 )
+
+# ============================================================
+# CALL TRACKING
+# ============================================================
+
+# Module-level dict: room_name -> {"call_id", "success", "reason"}
+# Used to log call outcomes when calls end.
+_call_state: dict[str, dict] = {}
 
 
 # ============================================================
@@ -397,9 +414,7 @@ details. Do NOT invent document lists if the tool fails.
                 "Please ask about one of these schemes."
             )
 
-        doc_list = "\n".join(
-            f"- {doc}" for doc in info["documents"]
-        )
+        doc_list = "\n".join(f"- {doc}" for doc in info["documents"])
 
         result = (
             f"Scheme: {info['full_name']}\n"
@@ -415,6 +430,16 @@ details. Do NOT invent document lists if the tool fails.
             "Scheme checklist returned for: %s",
             info["full_name"],
         )
+
+        # Mark call as successful
+        try:
+            ctx = get_job_context()
+            room = ctx.room.name
+            if room in _call_state:
+                _call_state[room]["success"] = True
+                _call_state[room]["reason"] = "scheme_checklist"
+        except Exception:
+            pass
 
         return result
 
@@ -446,9 +471,7 @@ details. Do NOT invent document lists if the tool fails.
         # Generate reference ID
         # ----------------------------------------------------
 
-        reference_id = (
-            f"ESC-{uuid.uuid4().hex[:6].upper()}"
-        )
+        reference_id = f"ESC-{uuid.uuid4().hex[:6].upper()}"
 
         # ----------------------------------------------------
         # Validate urgency
@@ -481,18 +504,12 @@ details. Do NOT invent document lists if the tool fails.
             "card number",
         ]
 
-        combined_text = (
-            f"{issue} "
-            f"{summary} "
-            f"{language} "
-            f"{preferred_followup}"
-        ).lower()
+        combined_text = (f"{issue} {summary} {language} {preferred_followup}").lower()
 
         for term in sensitive_terms:
             if term in combined_text:
                 logger.warning(
-                    "Potential sensitive information detected "
-                    "in escalation request."
+                    "Potential sensitive information detected in escalation request."
                 )
 
                 return (
@@ -522,14 +539,10 @@ details. Do NOT invent document lists if the tool fails.
         # Get Discord webhook
         # ----------------------------------------------------
 
-        webhook_url = os.getenv(
-            "DISCORD_ESCALATION_WEBHOOK_URL"
-        )
+        webhook_url = os.getenv("DISCORD_ESCALATION_WEBHOOK_URL")
 
         if not webhook_url:
-            logger.error(
-                "DISCORD_ESCALATION_WEBHOOK_URL is not configured."
-            )
+            logger.error("DISCORD_ESCALATION_WEBHOOK_URL is not configured.")
 
             return (
                 "The human assistance request could not be created "
@@ -543,18 +556,14 @@ details. Do NOT invent document lists if the tool fails.
         try:
             response = requests.post(
                 webhook_url,
-                json={
-                    "content": escalation_message
-                },
+                json={"content": escalation_message},
                 timeout=10,
             )
 
             response.raise_for_status()
 
         except Exception:
-            logger.exception(
-                "Failed to send escalation request."
-            )
+            logger.exception("Failed to send escalation request.")
 
             return (
                 "I could not create the human assistance request "
@@ -569,6 +578,16 @@ details. Do NOT invent document lists if the tool fails.
             "Escalation created successfully: %s",
             reference_id,
         )
+
+        # Mark call as successful
+        try:
+            ctx = get_job_context()
+            room = ctx.room.name
+            if room in _call_state:
+                _call_state[room]["success"] = True
+                _call_state[room]["reason"] = "escalation"
+        except Exception:
+            pass
 
         return (
             f"Human assistance request created successfully. "
@@ -592,9 +611,7 @@ details. Do NOT invent document lists if the tool fails.
 
         clean_name = name.strip().lower()
 
-        clean_name = "_".join(
-            clean_name.split()
-        )
+        clean_name = "_".join(clean_name.split())
 
         return f"user_{clean_name}"
 
@@ -616,6 +633,22 @@ details. Do NOT invent document lists if the tool fails.
         logger.info("TOOL CALLED: end_call")
 
         job_ctx = get_job_context()
+        room_name = job_ctx.room.name
+
+        # Log call outcome
+        state = _call_state.pop(room_name, None)
+        if state:
+            outcome = "success" if state["success"] else "failed"
+            log_call_end(
+                call_id=state["call_id"],
+                outcome=outcome,
+                success_reason=state.get("reason", ""),
+            )
+            logger.info(
+                "Call logged: %s (%s)",
+                state["call_id"],
+                outcome,
+            )
 
         await job_ctx.delete_room()
 
@@ -676,9 +709,7 @@ async def my_agent(ctx: JobContext):
         )
 
     else:
-        logger.info(
-            "Browser/WebRTC session (not outbound)"
-        )
+        logger.info("Browser/WebRTC session (not outbound)")
 
     # --------------------------------------------------------
     # CONNECT
@@ -686,10 +717,45 @@ async def my_agent(ctx: JobContext):
 
     await ctx.connect()
 
+    room_name = ctx.room.name
+
     logger.info(
         "Agent connected to room: %s",
-        ctx.room.name,
+        room_name,
     )
+
+    # --------------------------------------------------------
+    # REGISTER CALL START
+    # --------------------------------------------------------
+
+    call_id = uuid.uuid4().hex[:12]
+    channel = "outbound" if is_outbound else "browser"
+
+    log_call_start(call_id, room_name, channel)
+
+    _call_state[room_name] = {
+        "call_id": call_id,
+        "success": False,
+        "reason": "",
+    }
+
+    # Log call end if room disconnects without end_call
+    def on_room_disconnect():
+        state = _call_state.pop(room_name, None)
+        if state:
+            outcome = "success" if state["success"] else "failed"
+            log_call_end(
+                call_id=state["call_id"],
+                outcome=outcome,
+                success_reason=state.get("reason", ""),
+            )
+            logger.info(
+                "Call logged (room disconnect): %s (%s)",
+                state["call_id"],
+                outcome,
+            )
+
+    ctx.room.on("disconnected", on_room_disconnect)
 
     # --------------------------------------------------------
     # OUTBOUND CALL: CREATE SIP PARTICIPANT
@@ -698,7 +764,6 @@ async def my_agent(ctx: JobContext):
     demo_mode = False
 
     if is_outbound:
-
         trunk_id = os.getenv(
             "SIP_OUTBOUND_TRUNK_ID",
             "",
@@ -717,7 +782,6 @@ async def my_agent(ctx: JobContext):
             phone_number = "demo-user"
 
         if not demo_mode:
-
             logger.info(
                 "Creating SIP participant: trunk=%s, call_to=%s",
                 trunk_id,
@@ -725,7 +789,6 @@ async def my_agent(ctx: JobContext):
             )
 
             try:
-
                 await ctx.add_sip_participant(
                     call_to=phone_number,
                     trunk_id=trunk_id,
@@ -734,7 +797,6 @@ async def my_agent(ctx: JobContext):
                 )
 
             except api.TwirpError as e:
-
                 sip_code = e.metadata.get(
                     "sip_status_code",
                     "unknown",
@@ -746,8 +808,7 @@ async def my_agent(ctx: JobContext):
                 )
 
                 logger.error(
-                    "SIP call failed: %s "
-                    "(SIP %s %s) — falling back to demo mode",
+                    "SIP call failed: %s (SIP %s %s) — falling back to demo mode",
                     e.message,
                     sip_code,
                     sip_status,
@@ -756,35 +817,24 @@ async def my_agent(ctx: JobContext):
                 demo_mode = True
 
             except Exception:
-
-                logger.exception(
-                    "SIP call error — falling back to demo mode"
-                )
+                logger.exception("SIP call error — falling back to demo mode")
 
                 demo_mode = True
 
         if not demo_mode:
-
-            logger.info(
-                "SIP participant created, waiting for answer..."
-            )
+            logger.info("SIP participant created, waiting for answer...")
 
             try:
-
                 participant = await ctx.wait_for_participant(
                     identity=phone_number,
                 )
 
             except Exception:
-
-                logger.exception(
-                    "Timed out waiting — falling back to demo mode"
-                )
+                logger.exception("Timed out waiting — falling back to demo mode")
 
                 demo_mode = True
 
             else:
-
                 logger.info(
                     "SIP participant joined: %s",
                     participant.identity,
@@ -794,17 +844,13 @@ async def my_agent(ctx: JobContext):
     # CREATE VOICE SESSION
     # --------------------------------------------------------
 
-    logger.info(
-        "Creating FinAssist voice session..."
-    )
+    logger.info("Creating FinAssist voice session...")
 
     session = AgentSession(
         stt=deepgram.STT(),
         llm=inference.LLM(
             model="google/gemini-2.5-flash-lite",
-            extra_kwargs={
-                "max_completion_tokens": 1000
-            }
+            extra_kwargs={"max_completion_tokens": 1000},
         ),
         tts=murf.TTS(),
     )
@@ -819,9 +865,7 @@ async def my_agent(ctx: JobContext):
     )
 
     logger.info("========================================")
-    logger.info(
-        "FinAssist session started successfully"
-    )
+    logger.info("FinAssist session started successfully")
     logger.info("========================================")
 
     # --------------------------------------------------------
@@ -829,7 +873,6 @@ async def my_agent(ctx: JobContext):
     # --------------------------------------------------------
 
     if is_outbound:
-
         await session.generate_reply(
             instructions="""
 You are placing an outbound phone call on behalf of FinAssist,
@@ -879,7 +922,6 @@ IMPORTANT RULES:
         )
 
     else:
-
         await session.generate_reply(
             instructions="""
 Start the conversation.
