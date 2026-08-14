@@ -30,12 +30,8 @@ from database import (
     log_call_start,
     save_user,
 )
-from scheme_data import (
-    DATA_SOURCE,
-    LAST_UPDATED,
-    get_scheme_info,
-    list_available_schemes,
-)
+from government_scheme_specialist import GovernmentSchemeSpecialist
+from scheme_data import get_scheme_document_checklist_text
 
 # ============================================================
 # CALL TRACKING
@@ -44,6 +40,23 @@ from scheme_data import (
 # Module-level dict: room_name -> {"call_id", "success", "reason"}
 # Used to log call outcomes when calls end.
 _call_state: dict[str, dict] = {}
+
+
+def _mark_call_success(reason: str) -> None:
+    """Mark the current room's call as successful for the analytics log.
+
+    Safe to call outside a LiveKit job (for example in offline tests):
+    any error is swallowed and the call state is left untouched.
+    """
+
+    try:
+        ctx = get_job_context()
+        room = ctx.room.name
+        if room in _call_state:
+            _call_state[room]["success"] = True
+            _call_state[room]["reason"] = reason
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -73,7 +86,7 @@ logger.info(
 
 
 class FinAssist(Agent):
-    def __init__(self):
+    def __init__(self, chat_ctx=None):
         super().__init__(
             instructions="""
 You are FinAssist, an AI financial voice assistant for India.
@@ -87,7 +100,53 @@ You help users with:
 - Insurance
 - Digital payments
 - Fraud protection
-- Government financial schemes
+
+Government scheme questions are NOT answered by you. They are always
+transferred to a dedicated specialist (see the GOVERNMENT SCHEME
+ROUTING RULE below).
+
+
+GOVERNMENT SCHEME ROUTING RULE (MOST IMPORTANT):
+
+Government scheme requests are OUT OF SCOPE for you. Never answer
+them directly. Never start answering them. Never try to help the
+user choose, research, or apply for a government scheme yourself.
+
+Any request that is primarily about a government scheme must be
+transferred IMMEDIATELY using handoff_to_government_scheme_specialist,
+BEFORE you provide any scheme information.
+
+Hand off when the request is primarily about:
+
+- Government schemes
+- Government financial assistance
+- Subsidies
+- Government benefits
+- Scheme eligibility, or whether someone qualifies for a scheme
+- Documents required for a government scheme
+- How to apply for a government scheme
+
+Questions that MUST trigger the handoff tool:
+
+- "What government schemes are available for farmers?"
+- "Am I eligible for PM-KISAN?"
+- "What documents do I need for PM-KISAN?"
+- "What government subsidy can I get?"
+- "Which government scheme can help me financially?"
+- "How do I apply for a government financial scheme?"
+
+Questions that MUST NOT trigger the handoff tool (these stay with you):
+
+- "How should I budget my salary?"
+- "What is a savings account?"
+- "How can I save money?"
+- "What is an investment?"
+- "What is a bank account?"
+
+If the request matches the government-scheme category, call
+handoff_to_government_scheme_specialist. Do not answer the
+government-scheme question first, and do not use any other tool
+for it.
 
 Keep your answers short, natural and easy to understand because
 this is a voice conversation.
@@ -186,9 +245,12 @@ You have five tools:
 
 1. lookup_user
 2. save_user_memory
-3. get_scheme_document_checklist
+3. handoff_to_government_scheme_specialist
 4. create_escalation
 5. end_call
+
+The government scheme document tool is NOT available to you. It
+belongs to the Government Scheme Specialist only.
 
 
 MEMORY RULES:
@@ -214,11 +276,16 @@ Never claim to remember someone unless lookup_user confirms
 that saved information exists.
 
 
-SCHEME DOCUMENT TOOL:
+SCHEME DOCUMENT REQUESTS:
 
-When the user asks what documents, certificates, proofs, or
-paperwork are needed for any Indian government financial scheme,
-call get_scheme_document_checklist with the scheme name.
+Questions about documents, certificates, proofs, or paperwork
+needed for a government scheme are government-scheme requests.
+They are OUT OF SCOPE for you and you do NOT have the scheme
+document tool.
+
+Always transfer such questions using
+handoff_to_government_scheme_specialist. Never answer them
+yourself.
 
 This covers questions like:
 
@@ -226,16 +293,38 @@ This covers questions like:
 - "Which papers are required for a Mudra loan?"
 - "What proofs do I need for Ayushman Bharat?"
 
-When you read the result back to the user, convert it into
-natural spoken language. Do NOT read JSON or bullet symbols.
+The specialist reads the document checklist back to the user in
+natural spoken language, mentions that the data is from a local
+dataset, and states the last updated date.
 
-Mention that the data is from a local dataset and state the
-last updated date.
 
-If the tool returns a failure, tell the user you cannot access
-the information right now and do not want to give inaccurate
-details. Do NOT invent document lists if the tool fails.
-"""
+GOVERNMENT SCHEME SPECIALIST HANDOFF:
+
+You are the general financial services agent. There is also a
+dedicated Government Scheme Specialist who handles Indian government
+financial schemes in depth: government subsidies, benefits, scheme
+eligibility, scheme documents, and general guidance on applying for
+government schemes.
+
+Use the handoff_to_government_scheme_specialist tool when the user's
+request specifically requires government-scheme assistance, for
+example:
+
+- "Which government scheme am I eligible for?"
+- "Tell me about government subsidies for farmers."
+- "How do I apply for Ayushman Bharat?"
+- "What are the benefits of the Atal Pension Yojana?"
+
+DO NOT use the handoff tool for ordinary financial questions such as
+savings, budgeting, general finance, general banking, or basic
+investment concepts. Those stay with you.
+
+Only hand off when the request specifically requires government-scheme
+help. After calling the handoff tool, the specialist continues from
+the current conversation, so the user does not have to repeat
+anything.
+""",
+            chat_ctx=chat_ctx,
         )
 
     # ========================================================
@@ -378,58 +467,10 @@ details. Do NOT invent document lists if the tool fails.
             scheme_name,
         )
 
-        if not scheme_name or not scheme_name.strip():
-            available = list_available_schemes()
+        result = get_scheme_document_checklist_text(scheme_name)
 
-            return (
-                "No scheme name was provided. "
-                f"Available schemes: {', '.join(available)}. "
-                "Please ask about a specific scheme."
-            )
-
-        try:
-            info = get_scheme_info(scheme_name)
-        except Exception:
-            logger.exception("Failed to look up scheme data")
-
-            return (
-                "FAILURE: Unable to access scheme information "
-                "right now. I do not want to give you inaccurate "
-                "information. Please try again later or check the "
-                "official scheme website."
-            )
-
-        if info is None:
-            available = list_available_schemes()
-
-            logger.info(
-                "Scheme not found: %s. Available: %s",
-                scheme_name,
-                available,
-            )
-
-            return (
-                f"I could not find a scheme called '{scheme_name}'. "
-                f"Available schemes are: {', '.join(available)}. "
-                "Please ask about one of these schemes."
-            )
-
-        doc_list = "\n".join(f"- {doc}" for doc in info["documents"])
-
-        result = (
-            f"Scheme: {info['full_name']}\n"
-            f"Objective: {info['objective']}\n"
-            f"Required documents:\n{doc_list}\n"
-            f"Eligibility notes: {info['eligibility_notes']}\n"
-            f"Data source: {DATA_SOURCE}\n"
-            f"Data last updated: {LAST_UPDATED}\n"
-            f"Data type: Local dataset (not live data)"
-        )
-
-        logger.info(
-            "Scheme checklist returned for: %s",
-            info["full_name"],
-        )
+        if not result.startswith("Scheme:"):
+            return result
 
         # Mark call as successful
         try:
@@ -442,6 +483,57 @@ details. Do NOT invent document lists if the tool fails.
             pass
 
         return result
+
+    # ========================================================
+    # GOVERNMENT SCHEME SPECIALIST HANDOFF
+    # ========================================================
+
+    @function_tool
+    async def handoff_to_government_scheme_specialist(
+        self,
+        context: RunContext,
+    ) -> tuple:
+        """
+        Hand off the conversation to the Government Scheme Specialist.
+
+        USE THIS TOOL when the user needs dedicated help with an
+        Indian government financial scheme, such as:
+
+        - Government financial schemes (PM-KISAN, PMJJBY, PMSBY,
+          MUDRA, Sukanya Samriddhi, Atal Pension Yojana, Jan Dhan
+          Yojana, Kisan Credit Card, Ayushman Bharat, and similar)
+        - Government subsidies and benefits
+        - Scheme eligibility
+        - Basic scheme requirements and documents
+        - General guidance about applying for a government scheme
+
+        DO NOT use this tool for ordinary financial questions such as
+        savings, budgeting, general finance, general banking, or basic
+        investment concepts. Those stay with you, the general financial
+        agent. Only hand off when the request specifically requires
+        government-scheme assistance.
+        """
+
+        logger.info("TOOL CALLED: handoff_to_government_scheme_specialist")
+
+        try:
+            specialist = GovernmentSchemeSpecialist(
+                chat_ctx=self.chat_ctx.copy(exclude_instructions=True)
+            )
+        except Exception:
+            logger.exception("Failed to start the government scheme specialist")
+
+            return (
+                "I'm sorry, I was unable to connect you to our "
+                "government scheme specialist right now. I'll continue "
+                "helping you with your question as best I can. What "
+                "would you like to know?"
+            )
+
+        return (
+            specialist,
+            "I'll connect you to our government scheme specialist.",
+        )
 
     # ========================================================
     # HUMAN ESCALATION

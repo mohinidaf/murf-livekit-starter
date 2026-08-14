@@ -11,6 +11,10 @@ For the most current requirements, always refer to the official scheme
 website or your nearest bank / government office.
 """
 
+import logging
+
+logger = logging.getLogger("finassist.scheme_data")
+
 SCHEMES = {
     "pm kisan": {
         "full_name": "Pradhan Mantri Kisan Samman Nidhi (PM-KISAN)",
@@ -232,3 +236,63 @@ def get_scheme_info(scheme_name: str) -> dict | None:
 def list_available_schemes() -> list[str]:
     """Return sorted list of available scheme short names."""
     return sorted(SCHEMES.keys())
+
+
+def get_scheme_document_checklist_text(scheme_name: str) -> str:
+    """Return the full human-readable document checklist text for a scheme.
+
+    Shared by the main FinAssist agent and the Government Scheme
+    Specialist so both produce identical scheme answers.
+    """
+    if not scheme_name or not scheme_name.strip():
+        available = list_available_schemes()
+
+        return (
+            "No scheme name was provided. "
+            f"Available schemes: {', '.join(available)}. "
+            "Please ask about a specific scheme."
+        )
+
+    try:
+        info = get_scheme_info(scheme_name)
+    except Exception:
+        logger.exception("Failed to look up scheme data")
+
+        return (
+            "FAILURE: Unable to access scheme information "
+            "right now. I do not want to give you inaccurate "
+            "information. Please try again later or check the "
+            "official scheme website."
+        )
+
+    if info is None:
+        available = list_available_schemes()
+
+        logger.info(
+            "Scheme not found: %s. Available: %s",
+            scheme_name,
+            available,
+        )
+
+        return (
+            f"I could not find a scheme called '{scheme_name}'. "
+            f"Available schemes are: {', '.join(available)}. "
+            "Please ask about one of these schemes."
+        )
+
+    doc_list = "\n".join(f"- {doc}" for doc in info["documents"])
+
+    logger.info(
+        "Scheme checklist returned for: %s",
+        info["full_name"],
+    )
+
+    return (
+        f"Scheme: {info['full_name']}\n"
+        f"Objective: {info['objective']}\n"
+        f"Required documents:\n{doc_list}\n"
+        f"Eligibility notes: {info['eligibility_notes']}\n"
+        f"Data source: {DATA_SOURCE}\n"
+        f"Data last updated: {LAST_UPDATED}\n"
+        f"Data type: Local dataset (not live data)"
+    )
